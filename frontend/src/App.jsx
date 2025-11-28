@@ -8,6 +8,8 @@ const App = () => {
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState(null);
   const [error, setError] = useState(null);
+  const [removeMoire, setRemoveMoire] = useState(false);
+  const [fftCutoff, setFftCutoff] = useState(30);
 
   const handleFileChange = (e) => {
     const file = e.target.files[0];
@@ -26,6 +28,10 @@ const App = () => {
     setError(null);
     const formData = new FormData();
     formData.append('file', selectedFile);
+    if (removeMoire) {
+      formData.append('remove_moire', 'true');
+      formData.append('fft_cutoff', fftCutoff);
+    }
 
     try {
       // Ensure your Python backend is running on port 5000
@@ -99,7 +105,7 @@ const App = () => {
             Neural<span className="text-blue-600">Scan</span> Pipeline
           </h1>
           <p className="text-slate-600">
-            Local RTX-Accelerated Document Reconstruction System
+            CPU-Based Document Reconstruction System
           </p>
         </header>
 
@@ -119,6 +125,38 @@ const App = () => {
           {preview && (
             <div className="flex flex-col items-center gap-4">
               <img src={preview} alt="Preview" className="h-48 rounded shadow-md" />
+
+              {/* Moire Removal Options */}
+              <div className="flex items-center justify-center gap-4 p-4 rounded-lg bg-slate-50 border border-slate-200">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="moire-checkbox"
+                    checked={removeMoire}
+                    onChange={(e) => setRemoveMoire(e.target.checked)}
+                    className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                  />
+                  <label htmlFor="moire-checkbox" className="font-medium text-slate-700">
+                    Fix Moiré Noise (FFT)
+                  </label>
+                </div>
+                {removeMoire && (
+                  <div className="flex items-center gap-2">
+                    <label htmlFor="fft-cutoff" className="text-sm text-slate-600">Cutoff:</label>
+                    <input
+                      type="range"
+                      id="fft-cutoff"
+                      min="10"
+                      max="50"
+                      value={fftCutoff}
+                      onChange={(e) => setFftCutoff(e.target.value)}
+                      className="w-24"
+                    />
+                    <span className="text-sm font-bold text-slate-800 w-8">{fftCutoff}</span>
+                  </div>
+                )}
+              </div>
+
               <button 
                 onClick={processDocument}
                 disabled={loading}
@@ -138,10 +176,10 @@ const App = () => {
             
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6">
               <ImageCard 
-                title="0. Skew Correction" 
+                title="0. Pre-process" 
                 imageSrc={results.corrected} 
                 icon={ScanLine}
-                desc="PCA-based automatic tilt detection and straightening."
+                desc={results.moire_removed ? `FFT Moire Removal (Cutoff: ${results.fft_cutoff}) + Skew Correction.` : "PCA-based automatic tilt detection and straightening."}
               />
               <ImageCard 
                 title="1. Edge Detection" 

@@ -7,14 +7,30 @@ import base64
 import os
 import sys
 import json
+import logging
 
 # --- CONFIGURATION ---
-# Point to Tesseract executable (Windows Path)
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# Point to Tesseract executable (Windows Path) — allow override via env var
+tess_cmd = os.environ.get('TESSERACT_CMD', r'C:\Program Files\Tesseract-OCR\tesseract.exe')
+if os.path.exists(tess_cmd):
+    pytesseract.pytesseract.tesseract_cmd = tess_cmd
+else:
+    # Still set the path (so error messages from pytesseract are meaningful),
+    # but warn the developer that the executable was not found at that path.
+    pytesseract.pytesseract.tesseract_cmd = tess_cmd
+    # logging is configured below; safe to use print here briefly
+    print(f"Warning: Tesseract executable not found at '{tess_cmd}'.\n"
+          "Set the TESSERACT_CMD environment variable if installed elsewhere.")
 
 # Initialize Flask App
 app = Flask(__name__)
+# Limit uploads to 16 MB to avoid huge memory usage (tune as needed)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 CORS(app) # Allow React to communicate with this server
+
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
 # --- HELPER FUNCTIONS ---
 
@@ -37,7 +53,7 @@ def detect_and_correct_skew(image):
     points = cv2.findNonZero(dilated)
     
     if points is None or len(points) < 100:
-        print("Skew correction: insufficient edge points, skipping")
+        logger.debug("Skew correction: insufficient edge points, skipping")
         return image
     
     # Step 4: Apply PCA to find principal axis (orientation)
@@ -70,14 +86,14 @@ def detect_and_correct_skew(image):
     
     # Only correct if tilt is significant (> 0.5 degrees)
     if abs(angle_deg) < 0.5:
-        print("Skew correction: image already straight, skipping")
+        logger.debug("Skew correction: image already straight, skipping")
         return image
     
     # Apply only 2 degree correction (very gentle)
     # Clamp the detected angle to ±2 degrees maximum
     angle_deg = np.clip(-angle_deg, -2, 2)
     
-    print(f"Detected tilt: {angle_deg:.2f} degrees, applying correction")
+    logger.info(f"Detected tilt: {angle_deg:.2f} degrees, applying correction")
     
     # Step 6: Rotate image to straighten
     h, w = image.shape[:2]
@@ -93,7 +109,7 @@ def detect_and_correct_skew(image):
         flags=cv2.INTER_CUBIC
     )
     
-    print(f"Image rotated by {angle_deg:.2f} degrees")
+    logger.info(f"Image rotated by {angle_deg:.2f} degrees")
     return rotated
 
 def order_points(pts):
@@ -157,14 +173,77 @@ def four_point_transform(image, pts):
     try:
         M = cv2.getPerspectiveTransform(rect, dst)
         warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-        print(f"Perspective warp successful: {image.shape} -> {warped.shape}")
+        logger.info(f"Perspective warp successful: {image.shape} -> {warped.shape}")
         return warped
     except cv2.error as e:
-        print(f"Perspective transform error: {e}")
-        print(f"  rect shape: {rect.shape}, rect:\n{rect}")
-        print(f"  dst shape: {dst.shape}, dst:\n{dst}")
+        logger.exception("Perspective transform error: %s", e)
+        logger.debug("  rect shape: %s, rect:\n%s", rect.shape, rect)
+        logger.debug("  dst shape: %s, dst:\n%s", dst.shape, dst)
         # Fallback: return original image if warp fails
         return image
+
+    def remove_moire_fft(image, cutoff=30):
+        """
+        Reduce moire / periodic noise via a frequency-domain low-pass (Gaussian).
+
+        - `image` expected as BGR uint8 (OpenCV). We convert to grayscale
+          for FFT filtering and then blend the filtered result with the original
+          to preserve text edges.
+        - `cutoff` controls the width of the low-pass filter in pixels; lower
+          = stronger smoothing of higher frequencies (may blur fine text).
+
+        Returns a BGR uint8 image.
+        """
+        try:
+            # Work on grayscale to avoid per-channel artifacts
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            else:
+                gray = image.astype(np.float32)
+
+            rows, cols = gray.shape
+
+            # 2D FFT
+            f = np.fft.fft2(gray)
+            fshift = np.fft.fftshift(f)
+
+            # Create Gaussian low-pass mask
+            crow, ccol = rows // 2, cols // 2
+            y = np.arange(rows) - crow
+            x = np.arange(cols) - ccol
+            X, Y = np.meshgrid(x, y)
+            D2 = X**2 + Y**2
+            # Gaussian with sigma = cutoff
+            sigma = float(max(1.0, cutoff))
+            mask = np.exp(-D2 / (2 * (sigma**2)))
+
+            # Apply mask (attenuate high-frequencies)
+            fshift_filtered = fshift * mask
+
+            # Inverse FFT
+            f_ishift = np.fft.ifftshift(fshift_filtered)
+            img_back = np.fft.ifft2(f_ishift)
+            img_back = np.real(img_back)
+
+            # Normalize and convert back to uint8
+            img_back_norm = np.clip(img_back, 0, 255).astype(np.uint8)
+
+            # Blend filtered image with original grayscale to preserve edges
+            # Use unsharp-ish blend: keep original strong edges by weighted mix
+            blended = cv2.addWeighted(gray.astype(np.uint8), 0.6, img_back_norm, 0.4, 0)
+
+            # Optionally sharpen lightly to recover contrast
+            gaussian = cv2.GaussianBlur(blended, (3, 3), 0)
+            sharpened = cv2.addWeighted(blended, 1.2, gaussian, -0.2, 0)
+
+            # Convert back to BGR for downstream stages which expect 3 channels
+            result = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+            logger.info("Applied FFT moire removal (cutoff=%s)", cutoff)
+            return result
+        except Exception as e:
+            logger.exception("Error during moire FFT removal: %s", e)
+            # On error, return original image
+            return image
 
 def encode_image(image):
     """Convert OpenCV image to Base64 string for React."""
@@ -219,10 +298,10 @@ def stage2_detection(edges, original_h, original_w):
     
     # If no 4-point contour found, use image boundaries as fallback
     if doc_cnt is None:
-        print("No document contour found. Using full image boundaries.")
+        logger.warning("No document contour found. Using full image boundaries.")
         doc_cnt = np.array([[[0, 0]], [[original_w, 0]], [[original_w, original_h]], [[0, original_h]]])
     else:
-        print(f"Document detected with area: {detected_area} ({detected_area / (original_h * original_w) * 100:.1f}% of image)")
+        logger.info(f"Document detected with area: {detected_area} ({detected_area / (original_h * original_w) * 100:.1f}% of image)")
     
     return doc_cnt.reshape(4, 2)
 
@@ -263,10 +342,10 @@ def stage4_enhancement(image):
     """
     try:
         sr = cv2.dnn_superres.DnnSuperResImpl_create()
-        
-        # CHECK: Ensure you have 'FSRCNN_x4.pb' in the same folder as this script
-        model_path = "FSRCNN_x4.pb"
-        
+
+        # Prefer a model located next to this script; allow override via env var
+        model_path = os.environ.get('FSRCNN_MODEL_PATH', os.path.join(os.path.dirname(__file__), 'FSRCNN_x4.pb'))
+
         if os.path.exists(model_path):
             sr.readModel(model_path)
             sr.setModel("fsrcnn", 4) # 4x upscaling
@@ -276,18 +355,18 @@ def stage4_enhancement(image):
                 try:
                     sr.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
                     sr.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                    print("Attempting to use CUDA for SuperRes...")
+                    logger.info("Attempting to use CUDA for SuperRes...")
                 except cv2.error as e:
                     # Setting backend/target may still raise if the OpenCV build
                     # doesn't support DNN CUDA even if CUDA exists — fall back.
-                    print("Failed to enable DNN CUDA backend/target:", e)
+                    logger.warning("Failed to enable DNN CUDA backend/target: %s", e)
                     use_cuda = False
 
             if not use_cuda:
                 try:
                     sr.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
                     sr.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-                    print("Using CPU for SuperRes.")
+                    logger.info("Using CPU for SuperRes.")
                 except Exception:
                     # If setting fails, we'll still try upsample() which will use defaults
                     pass
@@ -296,7 +375,7 @@ def stage4_enhancement(image):
                 result = sr.upsample(image)
                 return result
             except cv2.error as e:
-                print("SuperRes upsample failed with OpenCV error:", e)
+                logger.exception("SuperRes upsample failed with OpenCV error: %s", e)
                 # Try CPU fallback if CUDA path failed
                 try:
                     sr.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
@@ -304,16 +383,16 @@ def stage4_enhancement(image):
                     result = sr.upsample(image)
                     return result
                 except Exception as e2:
-                    print("CPU SuperRes also failed. Falling back to bicubic. Error:", e2)
+                    logger.exception("CPU SuperRes also failed. Falling back to bicubic. Error: %s", e2)
                     h, w = image.shape[:2]
                     return cv2.resize(image, (w*4, h*4), interpolation=cv2.INTER_CUBIC)
         else:
-            print("FSRCNN model not found. Falling back to Bicubic.")
+            logger.warning("FSRCNN model not found at %s. Falling back to Bicubic.", model_path)
             # Fallback to standard Bicubic if model missing
             h, w = image.shape[:2]
             return cv2.resize(image, (w*4, h*4), interpolation=cv2.INTER_CUBIC)
     except Exception as e:
-        print(f"SuperRes Error: {e}")
+        logger.exception("SuperRes Error: %s", e)
         return image
 
 def stage4_binarization(image):
@@ -328,7 +407,7 @@ def stage4_binarization(image):
     else:
         gray = image
 
-    print(f"Initial: brightness={np.mean(gray):.1f}, contrast={np.std(gray)/(np.mean(gray)+1e-6):.2f}")
+    logger.debug(f"Initial: brightness={np.mean(gray):.1f}, contrast={np.std(gray)/(np.mean(gray)+1e-6):.2f}")
     
     # Step 1: Bilateral filter to smooth while preserving edges (no aggressive denoising)
     bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
@@ -337,7 +416,7 @@ def stage4_binarization(image):
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(10, 10))
     enhanced = clahe.apply(bilateral)
     
-    print(f"After CLAHE: brightness={np.mean(enhanced):.1f}, contrast={np.std(enhanced)/(np.mean(enhanced)+1e-6):.2f}")
+    logger.debug(f"After CLAHE: brightness={np.mean(enhanced):.1f}, contrast={np.std(enhanced)/(np.mean(enhanced)+1e-6):.2f}")
     
     # Step 3: Gamma correction only if truly overexposed
     mean_val = np.mean(enhanced)
@@ -346,7 +425,7 @@ def stage4_binarization(image):
         inv_gamma = 1.0 / gamma
         table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
         enhanced = cv2.LUT(enhanced, table)
-        print(f"Gamma correction applied: brightness now {np.mean(enhanced):.1f}")
+        logger.debug(f"Gamma correction applied: brightness now {np.mean(enhanced):.1f}")
     
     # Step 4: Moderate unsharp mask for text sharpness (not too aggressive)
     gaussian = cv2.GaussianBlur(enhanced, (3, 3), 1.0)
@@ -364,9 +443,9 @@ def stage4_binarization(image):
     # Step 7: Auto-invert if needed
     if np.mean(binary) < 128:
         binary = cv2.bitwise_not(binary)
-        print("Image inverted")
+        logger.debug("Image inverted")
     
-    print(f"Final binary: white_ratio={np.sum(binary == 255) / binary.size * 100:.1f}%")
+    logger.debug(f"Final binary: white_ratio={np.sum(binary == 255) / binary.size * 100:.1f}%")
     return binary
 
 def calculate_image_quality_metrics(gray_image):
@@ -444,7 +523,7 @@ def extract_ocr_metrics(binary_image):
         
         return metrics
     except Exception as e:
-        print(f"Error extracting OCR metrics: {e}")
+        logger.exception("Error extracting OCR metrics: %s", e)
         return {
             "mean_confidence": 0.0,
             "min_confidence": 0.0,
@@ -502,12 +581,33 @@ def process_document():
     # 1. Read Image
     file_bytes = np.frombuffer(file.read(), np.uint8)
     image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if image is None:
+        logger.warning("Uploaded file could not be decoded as an image")
+        return jsonify({"error": "Uploaded file is not a valid image or is corrupted"}), 400
     h, w = image.shape[:2]
 
     try:
         # STAGE 0: Skew Correction (NEW)
         # Detect and straighten tilted documents using PCA
         corrected = detect_and_correct_skew(image)
+
+        # Optional: Moire / periodic noise removal (FFT-based)
+        # Controlled by frontend checkbox / form field 'remove_moire'
+        remove_moire_flag = False
+        try:
+            val = request.form.get('remove_moire', '')
+            if isinstance(val, str) and val.lower() in ('1', 'true', 'yes', 'on'):
+                remove_moire_flag = True
+        except Exception:
+            remove_moire_flag = False
+
+        if remove_moire_flag:
+            # Optional cutoff parameter
+            try:
+                cutoff = int(request.form.get('fft_cutoff', 30))
+            except Exception:
+                cutoff = 30
+            corrected = remove_moire_fft(corrected, cutoff=cutoff)
         
         # STAGE 1: Preprocessing
         gray, edges = stage1_preprocess(corrected)
@@ -530,19 +630,19 @@ def process_document():
         # Use PSM 6 (uniform text block) - best for documents
         text_data = pytesseract.image_to_string(binary, config='--psm 6')
         ocr_metrics = extract_ocr_metrics(binary)
-        
+
         current_confidence = ocr_metrics.get('mean_confidence', 0)
         text_length = len(text_data.strip())
-        
-        print(f"OCR: {text_length} chars, confidence {current_confidence:.1f}")
+
+        logger.info("OCR: %d chars, confidence %.1f", text_length, current_confidence)
         if text_length == 0:
-            print("WARNING: OCR returned empty text.")
+            logger.warning("OCR returned empty text.")
 
         # Calculate quality metrics on enhanced image
         preprocessing_metrics = calculate_image_quality_metrics(enhanced)
         
-        print(f"Preprocessing: {preprocessing_metrics}")
-        print(f"OCR: {ocr_metrics}")
+        logger.debug("Preprocessing metrics: %s", preprocessing_metrics)
+        logger.debug("OCR metrics: %s", ocr_metrics)
 
         # Prepare Response
         response_data = {
@@ -552,6 +652,8 @@ def process_document():
             "scanned": encode_image(warped),
             "enhanced": encode_image(enhanced),
             "binary": encode_image(binary),
+            "moire_removed": bool(request.form.get('remove_moire', '') and request.form.get('remove_moire', '').lower() in ('1','true','yes','on')),
+            "fft_cutoff": int(request.form.get('fft_cutoff', 30)) if request.form.get('fft_cutoff') else None,
             "text": text_data,
             "metrics": {
                 "preprocessing": preprocessing_metrics,
@@ -562,7 +664,7 @@ def process_document():
         return jsonify(response_data)
 
     except Exception as e:
-        print(e)
+        logger.exception("Error processing document: %s", e)
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
